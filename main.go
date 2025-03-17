@@ -251,37 +251,67 @@ func GetFirstPost(htmlContent string) (title string, href string, err error) {
 
 // 检查登陆状态是否有效，若无效则执行登陆并加载cookie
 func (b *Browser) CheckLoginStatus() error {
-	// 等待 header 元素加载
-	if err := b.WaitForElement("div.header_up_sign"); err != nil {
-		return err
-	}
-	// 获取 header 的 HTML 内容（如果页面中有多个 div.header_up_sign，这里取第一个）
-	headerHTML, err := b.GetHTML("div.header_up_sign")
-	if err != nil {
-		return err
-	}
-	// 如果 header 包含“登录”且不包含“退出”，认为未登录（可根据实际情况判断，如检测用户名）
-	if strings.Contains(headerHTML, "登录") && !strings.Contains(headerHTML, "退出") {
-		// 检查 cookies 文件是否存在且不为空
-		fileInfo, err := os.Stat("./cookies")
-		if err != nil || fileInfo.Size() == 0 {
-			// 未登录且没有 cookies，则执行登录操作
-			if err := b.Login(); err != nil {
-				return err
-			}
-			// 登录成功后，保存 cookies 到文件
-			cookiesFile := b.SaveCookies()
-			log.Printf("登录成功，cookies 已保存到 %s", cookiesFile)
-		} else {
-			// cookies 文件不为空，执行 setCookies 操作
-			if err := b.SetCookies(); err != nil {
-				return err
-			}
-		}
-	} else {
-		log.Printf("检测到已登录状态")
-	}
-	return nil
+    // 等待 header 元素加载
+    if err := b.WaitForElement("div.header_up_sign"); err != nil {
+        return err
+    }
+    // 获取 header 的 HTML 内容（如果页面中有多个 div.header_up_sign，这里取第一个）
+    headerHTML, err := b.GetHTML("div.header_up_sign")
+    if err != nil {
+        return err
+    }
+    
+    // 检查 cookies 文件是否存在且未过期（不超过7天）
+    needLogin := false
+    cookiesExpired := false
+    
+    // 如果 header 包含"登录"且不包含"退出"，认为未登录
+    if strings.Contains(headerHTML, "登录") && !strings.Contains(headerHTML, "退出") {
+        needLogin = true
+    }
+    
+    // 检查 cookies 文件是否存在
+    fileInfo, err := os.Stat("./cookies")
+    if err != nil {
+        // cookies 文件不存在
+        needLogin = true
+    } else {
+        // 检查 cookies 文件的修改时间，如果超过7天则视为过期
+        if time.Since(fileInfo.ModTime()).Hours() > 24*7 {
+            log.Printf("cookies 已过期（超过7天），需要重新登录")
+            cookiesExpired = true
+            needLogin = true
+        }
+    }
+    
+    // 如果 cookies 过期，删除文件
+    if cookiesExpired {
+        err := os.Remove("./cookies")
+        if err != nil {
+            log.Printf("删除过期 cookies 文件失败: %v", err)
+        } else {
+            log.Printf("已删除过期 cookies 文件")
+        }
+    }
+    
+    if needLogin {
+        // 执行登录操作
+        if err := b.Login(); err != nil {
+            return err
+        }
+        // 登录成功后，保存 cookies 到文件
+        cookiesFile := b.SaveCookies()
+        log.Printf("登录成功，cookies 已保存到 %s", cookiesFile)
+    } else if fileInfo != nil && fileInfo.Size() > 0 {
+        // cookies 文件存在且不为空，执行 setCookies 操作
+        if err := b.SetCookies(); err != nil {
+            return err
+        }
+        log.Printf("使用已有的 cookies 登录成功")
+    } else {
+        log.Printf("检测到已登录状态")
+    }
+    return nil
 }
 
 // 填写登录表单中：用户名、密码、安全问题（选择“我的中学校名”，value="4"）、答案

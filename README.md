@@ -6,7 +6,7 @@
 
 - 使用 chromedp 实现网页自动化操作，使用 headless 模式，模拟人工操作
 - 自动登录、保存并加载 cookies
-- 随机等待时间，避免被检测(定时任务的时间 + 随机等待时间10分钟)
+- 随机等待时间，避免被检测(定时任务的时间 + 自定义随机等待时间s)
 - 自动回帖与签到操作
 - 签到成功后发送 Telegram 通知，暂时只支持单个 chatID
 - 内置 Makefile 支持跨平台构建
@@ -15,7 +15,7 @@
 ## 前置条件
 
 - chrome/chromium
-- Go 1.23.5+
+- Go 1.24+
 
 ## 使用说明
 
@@ -24,8 +24,11 @@
 **修改 `.env.example` 文件为 `.env`，并填入你的配置信息**
 
 ```bash
-go build -o app main.go
-./app
+go run main.go
+
+# 或者使用 Makefile 构建
+make build/make build-all
+./build/daysign2048_mac
 ```
 
 ### 2. 服务器部署
