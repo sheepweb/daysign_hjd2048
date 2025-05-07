@@ -39,6 +39,7 @@ make build/make build-all
 # Ubuntu
 sudo apt-get update
 sudo apt-get install -y chromium-browser
+sudo snap install chromium
 ```
 
 
@@ -64,22 +65,20 @@ make build-all
 - 选择适合服务器架构，将生成的二进制文件 `daysign2048_xx` 修改为 `daysign2048`上传到服务器
 - 例如：/root目录下
 
-5. 使用 Crontab 定时任务
+5. 执行脚本运行程序
+```bash
+./start.sh
+```
+
+### 3. 使用 Docker 部署
 
 ```bash
-# 确保二进制文件有执行权限
-chmod +x /root/daysign2048
-
-# 编辑定时任务
-crontab -e
-
-# 添加以下内容，每天凌晨 0 点 15 分执行
-15 0 * * * cd /root && ./daysign2048 >> /root/daysign2048.log 2>&1
+docker build -t daysign2048 .
 ```
 
 ## 未来计划
 - [x] 使用环境变量配置信息用户信息, 系统配置信息
 - [x] 通知信息更加详细
+- [x] 程序内置定时任务，无需使用 Crontab
 - [ ] 支持更多通知方式，如钉钉、企业微信，邮箱等
 - [ ] 自定义安全问题与答案
-- [ ] 程序内置定时任务，无需使用 Crontab
