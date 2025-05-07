@@ -8,26 +8,35 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
-	"math/rand"
+	"math/rand/v2"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
+	"github.com/robfig/cron/v3"
 	"golang.org/x/net/html"
 )
 
 const (
 	ContentSelector        = ".t.z"
 	ThreadTextAreaSelector = "#textarea"
+	UserInfoSelector       = ".pwB_uConside_a"
 )
 
-// 多个回帖的内容
+// 回帖的内容
 var ReplyContents = []string{
 	"感谢楼主分享好片",
 	"感谢分享！！",
@@ -70,24 +79,50 @@ var ReplyContents = []string{
 	"真是极品啊",
 	"这个眼神谁顶得住。",
 	"妙不可言",
+	"感谢分享这一部资源",
+	"终于来了，等了好久了。",
+	"等这一部等了好久了！",
+	"确实不错。",
+	"真是太好看了",
 }
+
+// 全局变量，用于存储日志文件
+var currentLogFile *os.File
+
+// 全局任务状态和调度器
+var (
+	todayCheckInSuccess bool
+	lastCheckInDate     string
+
+	taskMutex       sync.Mutex
+	isTaskRunning   bool
+	lastRunTime     time.Time
+	lastSuccessTime time.Time
+	scheduler       *cron.Cron
+	retryTimer      *time.Timer
+)
 
 // env变量
 var (
-	BaseURL        string
-	LoginSection   string
-	ReplySection   string
-	CheckInSection string
-	MyBotToken     string
-	ChatID         int64
-	EnableHeadless bool
-	WaitingTime    int
+	BaseURL         string
+	LoginSection    string
+	ReplySection    string
+	CheckInSection  string
+	UserInfoSection string
+	MyBotToken      string
+	ChatID          int64
+	EnableHeadless  bool
+	WaitingTime     int
+	RetryInterval   time.Duration
+	CronSchedule    string
+	RunOnStart      bool
 )
 
 // Browser 结构体封装了 chromedp 的执行上下文，用于后续多步操作
 type Browser struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	cmd    *exec.Cmd // 记录 Chrome 进程
 }
 
 // init 用于初始化环境变量
@@ -102,6 +137,7 @@ func init() {
 	LoginSection = os.Getenv("LOGIN_SECTION")
 	ReplySection = os.Getenv("REPLY_SECTION")
 	CheckInSection = os.Getenv("CHECK_IN_SECTION")
+	UserInfoSection = os.Getenv("USER_INFO_SECTION")
 	MyBotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 
 	// 转换 TELEGRAM_CHAT_ID 为 int64
@@ -124,20 +160,387 @@ func init() {
 			WaitingTime = waitingTime
 		}
 	}
+
+	CronSchedule = os.Getenv("CRON_SCHEDULE")
+
+	// 转化 RETRY_INTERVAL 为 duration
+	if retryIntervalStr := os.Getenv("RETRY_INTERVAL"); retryIntervalStr != "" {
+		if minutes, err := strconv.Atoi(retryIntervalStr); err == nil {
+			RetryInterval = time.Duration(minutes) * time.Minute
+		} else {
+			// 尝试作为带单位的时间解析
+			if duration, err := time.ParseDuration(retryIntervalStr); err == nil {
+				RetryInterval = duration
+			} else {
+				log.Printf("无法解析重试间隔 '%s'，使用默认值30分钟", retryIntervalStr)
+				RetryInterval = 30 * time.Minute
+			}
+		}
+	} else {
+		RetryInterval = 30 * time.Minute // 默认重试间隔为30分钟
+	}
+
+	// 转化 RUN_ON_START 为 bool
+	if runOnStartStr := os.Getenv("RUN_ON_START"); runOnStartStr != "" {
+		if runOnStart, err := strconv.ParseBool(runOnStartStr); err == nil {
+			RunOnStart = runOnStart
+		}
+	}
+
+	// 配置日志
+	setupLogger()
+}
+
+// 设置日志
+func setupLogger() {
+	// 关闭之前的日志文件
+	if currentLogFile != nil {
+		currentLogFile.Close()
+	}
+
+	// 确保logs目录存在
+	os.MkdirAll("logs", 0755)
+
+	// 清理旧日志
+	cleanupOldLogs(7)
+
+	// 创建日志文件(日期为当天--当天+7天)
+	logFileName := fmt.Sprintf("logs/hjd2048_daysign_%s.log", time.Now().Format("2006-01-02"))
+	logFile, err := os.OpenFile(logFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("无法创建日志文件: %v", err)
+		return
+	}
+
+	// 同时输出到控制台和文件
+	log.SetOutput(io.MultiWriter(os.Stdout, logFile))
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
+	// 保存当前日志文件指针
+	currentLogFile = logFile
+}
+
+// 清理超过指定天数的旧日志
+func cleanupOldLogs(daysToKeep int) {
+	files, err := os.ReadDir("logs")
+	if err != nil {
+		log.Printf("读取日志目录失败: %v", err)
+		return
+	}
+
+	// 计算截止日期
+	cutoffDate := time.Now().AddDate(0, 0, -daysToKeep)
+
+	// 日志文件名格式正则表达式
+	logFilePattern := regexp.MustCompile(`hjd2048_daysign_(\d{4}-\d{2}-\d{2})\.log`)
+
+	removed := 0
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+
+		// 匹配日志文件名
+		matches := logFilePattern.FindStringSubmatch(file.Name())
+		if len(matches) < 2 {
+			continue
+		}
+
+		// 解析日志文件日期
+		fileDate, err := time.Parse("2006-01-02", matches[1])
+		if err != nil {
+			log.Printf("无法解析日志文件日期 %s: %v", file.Name(), err)
+			continue
+		}
+
+		// 如果文件日期早于截止日期，删除文件
+		if fileDate.Before(cutoffDate) {
+			if err := os.Remove(filepath.Join("logs", file.Name())); err != nil {
+				log.Printf("删除过期日志文件 %s 失败: %v", file.Name(), err)
+			} else {
+				log.Printf("已删除过期日志文件: %s", file.Name())
+				removed++
+			}
+		}
+	}
+
+	if removed > 0 {
+		log.Printf("共清理了 %d 个过期日志文件", removed)
+	}
+}
+
+// executeTask 执行完整的任务流程，任何步骤失败都会导致整个任务失败
+func executeTask() {
+	// 检查任务是否已经在运行
+	taskMutex.Lock()
+	if isTaskRunning {
+		log.Println("任务已在运行中，跳过本次执行")
+		taskMutex.Unlock()
+		return
+	}
+	// 如果距离上次执行时间不足5分钟，跳过本次执行
+	if !lastRunTime.IsZero() && time.Since(lastRunTime) < 5*time.Minute {
+		log.Printf("距离上次执行仅 %v，小于5分钟，跳过本次执行", time.Since(lastRunTime))
+		taskMutex.Unlock()
+		return
+	}
+
+	// 获取当前日期
+	currentDate := time.Now().Format("2006-01-02")
+
+	// 检查是否是新的一天，如果是则重置签到状态
+	if currentDate != lastCheckInDate {
+		todayCheckInSuccess = false
+		lastCheckInDate = currentDate
+	}
+
+	// 如果今天已经成功签到，直接返回，不执行任务
+	if todayCheckInSuccess {
+		taskMutex.Unlock()
+		return
+	}
+
+	// 更新任务状态
+	isTaskRunning = true
+	lastRunTime = time.Now()
+	taskMutex.Unlock()
+
+	// 函数结束时清理状态
+	defer func() {
+		taskMutex.Lock()
+		isTaskRunning = false
+		taskMutex.Unlock()
+	}()
+
+	log.Println("开始执行任务...")
+
+	// 收集任务结果
+	var message strings.Builder
+	currentTime := time.Now().Format("2006年01月02日 15:04:05")
+	message.WriteString(fmt.Sprintf("%s 任务开始\n", currentTime))
+
+	// 创建浏览器实例
+	browser, err := NewBrowser()
+	if err != nil {
+		log.Printf("创建浏览器实例失败: %v", err)
+		scheduleRetry("创建浏览器失败: " + err.Error())
+		return
+	}
+
+	// 确保无论如何浏览器都会被关闭
+	browserClosed := false
+	defer func() {
+		if !browserClosed {
+			log.Println("关闭浏览器实例...")
+			browser.Close()
+		}
+	}()
+
+	// 1. 访问论坛回帖页面
+	replyURL := BaseURL + ReplySection
+	if err = browser.NavigateTo(replyURL); err != nil {
+		log.Printf("导航回帖页失败: %v", err)
+		scheduleRetry("导航回帖页失败: " + err.Error())
+		return
+	}
+
+	// 2. 检查登陆状态
+	if err = browser.CheckLoginStatus(); err != nil {
+		log.Printf("检查登陆状态出错：%v", err)
+		scheduleRetry("检查登陆状态出错: " + err.Error())
+		return
+	}
+
+	// 3. 获取第一个符合条件的帖子数据
+	postTitle, href, err := browser.GetFirstPost()
+	if err != nil {
+		log.Printf("提取数据失败: %v", err)
+		scheduleRetry("提取数据失败: " + err.Error())
+		return
+	}
+
+	// 4. 打开帖子
+	fullURL := BaseURL + href
+	if err = browser.NavigateTo(fullURL); err != nil {
+		log.Printf("打开帖子失败: %v", err)
+		scheduleRetry("打开帖子失败: " + err.Error())
+		return
+	}
+
+	// 5. 回帖
+	replyContent, err := browser.ReplyPost()
+	if err != nil {
+		log.Printf("回帖失败: %v", err)
+		scheduleRetry("回帖失败: " + err.Error())
+		return
+	}
+	log.Printf("成功回复帖子: \n标题：%s, \n回帖：%s", postTitle, replyContent)
+
+	// 6. 签到
+	checkInResult, err := browser.CheckIn()
+	if err != nil {
+		log.Printf("签到失败: %v", err)
+		scheduleRetry("签到失败: " + err.Error())
+		return
+	}
+
+	// 7. 获取用户信息
+	userInfo, err := browser.GetUserInfo()
+	if err != nil {
+		log.Printf("获取用户信息失败: %v", err)
+		scheduleRetry("获取用户信息失败: " + err.Error())
+		return
+	}
+
+	replyInfo := fmt.Sprintf("成功回复帖子: \n标题：%s, \n回帖：%s", postTitle, replyContent)
+
+	// 8. 发送通知
+	notificationMsg := fmt.Sprintf(
+		"✅ hjd2048 ✅，\n时间: %s\n%s\n%s\n%s",
+		time.Now().Format("2006-01-02 15:04:05"),
+		replyInfo,
+		checkInResult,
+		userInfo,
+	)
+	if err := SendTelegramNotification(notificationMsg); err != nil {
+		log.Printf("发送通知失败: %v", err)
+		scheduleRetry("发送通知失败: " + err.Error())
+		return
+	}
+
+	// 任务成功，更新上次成功时间
+	taskMutex.Lock()
+	lastSuccessTime = time.Now()
+	taskMutex.Unlock()
+
+	// 在函数结束前明确关闭浏览器
+	log.Println("任务完成，关闭浏览器...")
+	browser.Close()
+	browserClosed = true
+}
+
+// scheduleRetry 安排任务重试
+func scheduleRetry(reason string) {
+	// 获取当前日期
+	currentDate := time.Now().Format("2006-01-02")
+
+	taskMutex.Lock()
+	// 如果今天已经成功签到，不安排重试
+	if todayCheckInSuccess && currentDate == lastCheckInDate {
+		log.Printf("今天已经成功签到，不重试: %s", reason)
+		taskMutex.Unlock()
+		return
+	}
+	taskMutex.Unlock()
+
+	log.Printf("任务失败，原因: %s，将在 %v 后重试", reason, RetryInterval)
+
+	// 取消之前的重试计时器（如果存在）
+	if retryTimer != nil {
+		retryTimer.Stop()
+	}
+
+	// 设置新的重试计时器
+	retryTimer = time.AfterFunc(RetryInterval, func() {
+		// 重试前再次检查是否已成功签到
+		currentDate := time.Now().Format("2006-01-02")
+		taskMutex.Lock()
+		alreadySuccess := todayCheckInSuccess && currentDate == lastCheckInDate
+		taskMutex.Unlock()
+
+		if alreadySuccess {
+			log.Println("定时重试前检测到今天已经成功签到，取消重试")
+			return
+		}
+
+		log.Println("开始重试任务...")
+		executeTask()
+	})
+
+	// 发送失败通知
+	failureMsg := fmt.Sprintf(
+		"❌ 任务失败 ❌\n时间: %s\n原因: %s\n将在 %d 分钟后重试",
+		time.Now().Format("2006-01-02 15:04:05"),
+		reason,
+		int(RetryInterval.Minutes()),
+	)
+
+	if err := SendTelegramNotification(failureMsg); err != nil {
+		log.Printf("发送失败通知失败: %v", err)
+	}
+}
+
+// startScheduler 启动定时调度器
+func startScheduler() {
+	scheduler = cron.New(cron.WithSeconds())
+
+	// 添加定时任务
+	_, err := scheduler.AddFunc(CronSchedule, executeTask)
+	if err != nil {
+		log.Fatalf("添加定时任务失败: %v", err)
+	}
+
+	// 启动调度器
+	scheduler.Start()
 }
 
 // NewBrowser 创建新的浏览器实例，并启动浏览器，确保上下文可用
 func NewBrowser() (*Browser, error) {
+	// 从环境变量中获取Chrome路径
+	chromePath := os.Getenv("CHROME_PATH")
+	if chromePath == "" {
+		// 尝试几个常见的路径
+		possiblePaths := []string{
+			"/snap/bin/chromium",
+			"chromium",
+			"google-chrome",
+			"chromium-browser",
+			"/usr/bin/chromium",
+			"/usr/bin/chromium-browser",
+			"/usr/bin/google-chrome",
+		}
+
+		for _, path := range possiblePaths {
+			// 使用 which 命令检查可执行文件是否存在
+			cmd := exec.Command("which", path)
+			if err := cmd.Run(); err == nil {
+				chromePath = path
+				log.Printf("自动检测到Chrome路径: %s", chromePath)
+				break
+			}
+		}
+
+		if chromePath == "" {
+			log.Println("未找到Chrome可执行文件，请设置CHROME_PATH环境变量")
+		}
+	} else {
+		log.Printf("使用环境变量中配置的Chrome路径: %s", chromePath)
+	}
+
+	// 强制杀死所有可能残留的 Chrome 进程
+	if os.Getenv("FORCE_KILL_CHROME") == "true" {
+		killPreviousChrome()
+	}
+
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.NoDefaultBrowserCheck,
-		// 非无头模式便于调试, 本地测试改成false，启动图形界面
 		chromedp.Flag("headless", EnableHeadless),
-		chromedp.Flag("ignore-certificate-errors", true),
-		chromedp.Flag("disable-web-security", true),
-		chromedp.NoFirstRun,
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-software-rasterizer", true),
+		chromedp.Flag("disable-extensions", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
+		chromedp.Flag("disable-infobars", true),
+		chromedp.Flag("disable-notifications", true),
+		chromedp.Flag("mute-audio", true),
+		chromedp.Flag("ignore-certificate-errors", true),
+		chromedp.Flag("disable-popup-blocking", true),
+		chromedp.Flag("incognito", true),
+		chromedp.Flag("disable-translate", true),
+		chromedp.Flag("disable-sync", true),
+		chromedp.Flag("disable-background-networking", true),
+		chromedp.ExecPath(chromePath),
 	)
 
 	// 创建分配器上下文
@@ -159,6 +562,97 @@ func NewBrowser() (*Browser, error) {
 		ctx:    ctx,
 		cancel: combinedCancel,
 	}, nil
+}
+
+// 修改监控函数以支持退出
+func monitorChromeProcesses(stop chan struct{}) {
+	log.Println("开始监控Chrome进程...")
+	ticker := time.NewTicker(30 * time.Minute)
+	defer ticker.Stop()
+
+	// 立即执行一次检查
+	checkChromeProcesses()
+
+	for {
+		select {
+		case <-ticker.C:
+			checkChromeProcesses()
+		case <-stop:
+			log.Println("Chrome进程监控已停止")
+			return
+		}
+	}
+}
+
+// 检查Chrome进程数量并在必要时清理
+func checkChromeProcesses() {
+	var cmd *exec.Cmd
+	var output []byte
+	var err error
+	var count int
+
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH")
+		output, err = cmd.Output()
+		if err == nil {
+			// Windows: 计算输出中"chrome.exe"的行数
+			count = strings.Count(string(output), "chrome.exe")
+		}
+	} else {
+		// Linux/macOS: 使用 pgrep 获取进程数量
+		cmd = exec.Command("pgrep", "-c", "chrom")
+		output, err = cmd.Output()
+		if err == nil && len(output) > 0 {
+			count, _ = strconv.Atoi(strings.TrimSpace(string(output)))
+		}
+	}
+
+	// 如果出现错误，可能是因为没有找到任何进程
+	if err != nil {
+		log.Printf("检查Chrome进程状态: 未发现Chrome进程或执行命令失败: %v", err)
+		return
+	}
+
+	log.Printf("检测到 %d 个Chrome相关进程", count)
+
+	// 如果进程数量超过阈值，则进行清理
+	if count > 5 {
+		log.Printf("Chrome进程数量(%d)超过阈值，执行清理...", count)
+		killPreviousChrome()
+
+		// 清理后再次检查
+		time.Sleep(5 * time.Second)
+		checkChromeProcesses()
+	}
+}
+
+// 改进强制终止Chrome进程的函数
+func killPreviousChrome() {
+	log.Println("正在终止残留的Chrome进程...")
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("taskkill", "/F", "/IM", "chrome.exe", "/IM", "chromium.exe")
+	} else if runtime.GOOS == "darwin" {
+		// macOS 特殊处理
+		cmd = exec.Command("pkill", "-9", "-f", "Google Chrome")
+		cmd.Run() // 忽略错误
+		cmd = exec.Command("pkill", "-9", "-f", "Chromium")
+	} else {
+		// Linux
+		cmd = exec.Command("pkill", "-9", "-f", "chrom")
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// 进程不存在时不报错
+		if !strings.Contains(string(output), "没有找到") &&
+			!strings.Contains(string(output), "not found") {
+			log.Printf("终止Chrome进程时出现错误: %v", err)
+		}
+	} else {
+		log.Println("成功终止Chrome进程")
+	}
 }
 
 // Close 关闭浏览器实例
@@ -204,7 +698,24 @@ func (b *Browser) Input(selector, text string) error {
 }
 
 // GetFirstPost 从页面 HTML 中提取“广告连接”后第一个符合条件的帖子数据
-func GetFirstPost(htmlContent string) (title string, href string, err error) {
+func (b *Browser) GetFirstPost() (title string, href string, err error) {
+	// 访问论坛回帖页面
+	replyURL := BaseURL + ReplySection
+	// 访问论坛回帖页面并提取帖子数据
+	if err = b.NavigateTo(replyURL); err != nil {
+		log.Printf("导航回帖页失败: %v", err)
+		return
+	}
+	if err = b.WaitForElement(ContentSelector); err != nil {
+		log.Printf("等待元素失败: %v", err)
+		return
+	}
+	htmlContent, err := b.GetHTML("body")
+	if err != nil {
+		log.Printf("获取HTML失败: %v", err)
+		return
+	}
+
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
 	if err != nil {
 		return "", "", err
@@ -251,67 +762,67 @@ func GetFirstPost(htmlContent string) (title string, href string, err error) {
 
 // 检查登陆状态是否有效，若无效则执行登陆并加载cookie
 func (b *Browser) CheckLoginStatus() error {
-    // 等待 header 元素加载
-    if err := b.WaitForElement("div.header_up_sign"); err != nil {
-        return err
-    }
-    // 获取 header 的 HTML 内容（如果页面中有多个 div.header_up_sign，这里取第一个）
-    headerHTML, err := b.GetHTML("div.header_up_sign")
-    if err != nil {
-        return err
-    }
-    
-    // 检查 cookies 文件是否存在且未过期（不超过7天）
-    needLogin := false
-    cookiesExpired := false
-    
-    // 如果 header 包含"登录"且不包含"退出"，认为未登录
-    if strings.Contains(headerHTML, "登录") && !strings.Contains(headerHTML, "退出") {
-        needLogin = true
-    }
-    
-    // 检查 cookies 文件是否存在
-    fileInfo, err := os.Stat("./cookies")
-    if err != nil {
-        // cookies 文件不存在
-        needLogin = true
-    } else {
-        // 检查 cookies 文件的修改时间，如果超过7天则视为过期
-        if time.Since(fileInfo.ModTime()).Hours() > 24*7 {
-            log.Printf("cookies 已过期（超过7天），需要重新登录")
-            cookiesExpired = true
-            needLogin = true
-        }
-    }
-    
-    // 如果 cookies 过期，删除文件
-    if cookiesExpired {
-        err := os.Remove("./cookies")
-        if err != nil {
-            log.Printf("删除过期 cookies 文件失败: %v", err)
-        } else {
-            log.Printf("已删除过期 cookies 文件")
-        }
-    }
-    
-    if needLogin {
-        // 执行登录操作
-        if err := b.Login(); err != nil {
-            return err
-        }
-        // 登录成功后，保存 cookies 到文件
-        cookiesFile := b.SaveCookies()
-        log.Printf("登录成功，cookies 已保存到 %s", cookiesFile)
-    } else if fileInfo != nil && fileInfo.Size() > 0 {
-        // cookies 文件存在且不为空，执行 setCookies 操作
-        if err := b.SetCookies(); err != nil {
-            return err
-        }
-        log.Printf("使用已有的 cookies 登录成功")
-    } else {
-        log.Printf("检测到已登录状态")
-    }
-    return nil
+	// 等待 header 元素加载
+	if err := b.WaitForElement("div.header_up_sign"); err != nil {
+		return err
+	}
+	// 获取 header 的 HTML 内容（如果页面中有多个 div.header_up_sign，这里取第一个）
+	headerHTML, err := b.GetHTML("div.header_up_sign")
+	if err != nil {
+		return err
+	}
+
+	// 检查 cookies 文件是否存在且未过期（不超过7天）
+	needLogin := false
+	cookiesExpired := false
+
+	// 如果 header 包含"登录"且不包含"退出"，认为未登录
+	if strings.Contains(headerHTML, "登录") && !strings.Contains(headerHTML, "退出") {
+		needLogin = true
+	}
+
+	// 检查 cookies 文件是否存在
+	fileInfo, err := os.Stat("./cookies")
+	if err != nil {
+		// cookies 文件不存在
+		needLogin = true
+	} else {
+		// 检查 cookies 文件的修改时间，如果超过7天则视为过期
+		if time.Since(fileInfo.ModTime()).Hours() > 24*7 {
+			log.Printf("cookies 已过期（超过7天），需要重新登录")
+			cookiesExpired = true
+			needLogin = true
+		}
+	}
+
+	// 如果 cookies 过期，删除文件
+	if cookiesExpired {
+		err := os.Remove("./cookies")
+		if err != nil {
+			log.Printf("删除过期 cookies 文件失败: %v", err)
+		} else {
+			log.Printf("已删除过期 cookies 文件")
+		}
+	}
+
+	if needLogin {
+		// 执行登录操作
+		if err := b.Login(); err != nil {
+			return err
+		}
+		// 登录成功后，保存 cookies 到文件
+		cookiesFile := b.SaveCookies()
+		log.Printf("登录成功，cookies 已保存到 %s", cookiesFile)
+	} else if fileInfo != nil && fileInfo.Size() > 0 {
+		// cookies 文件存在且不为空，执行 setCookies 操作
+		if err := b.SetCookies(); err != nil {
+			return err
+		}
+		log.Printf("使用已有的 cookies 登录成功")
+	} else {
+		log.Printf("检测到已登录状态")
+	}
+	return nil
 }
 
 // 填写登录表单中：用户名、密码、安全问题（选择“我的中学校名”，value="4"）、答案
@@ -421,24 +932,29 @@ func (b *Browser) SetCookies() error {
 }
 
 // replyPost 回帖
-func (b *Browser) ReplyPost() error {
+func (b *Browser) ReplyPost() (string, error) {
 	// 等待回帖区域加载
 	if err := b.WaitForElement(ThreadTextAreaSelector); err != nil {
-		return err
+		log.Printf("等待回帖区域加载失败: %v", err)
+		return "", err
 	}
+
 	// 随机选择回帖内容
 	replyContent := ReplyContents[time.Now().Unix()%int64(len(ReplyContents))]
 	// 输入回帖内容
 	if err := b.Input(ThreadTextAreaSelector, replyContent); err != nil {
-		return err
+		log.Printf("输入回帖内容失败: %v", err)
+		return "", err
 	}
+
 	// 点击回帖按钮
 	if err := b.Click(".btn.fpbtn"); err != nil {
-		return err
+		log.Printf("点击回帖按钮失败: %v", err)
+		return "", err
 	}
 	// 等待3秒，刷新页面
 	time.Sleep(3 * time.Second)
-	return nil
+	return replyContent, nil
 }
 
 // 到签到页面签到
@@ -453,8 +969,7 @@ func (b *Browser) CheckIn() (string, error) {
 	}
 	// 随机选择一个表情
 	expressions := []string{"kx", "ng", "ym", "wl", "nu", "ch", "fd", "yl", "shuai"}
-	rand.Seed(time.Now().UnixNano())
-	selected := expressions[rand.Intn(len(expressions))]
+	selected := expressions[rand.IntN(len(expressions))]
 	// 获取签到结果文本
 	var resultText string
 	// 执行选择表情与点击签到按钮的操作
@@ -472,6 +987,65 @@ func (b *Browser) CheckIn() (string, error) {
 	}
 	log.Printf("%s 签到结果：%s", time.Now().Format("2006-01-02"), resultText)
 	return resultText, nil
+}
+
+// GetUserInfo 获取用户信息
+func (b *Browser) GetUserInfo() (string, error) {
+	// 直接导航到用户信息页面
+	if err := b.NavigateTo(BaseURL + UserInfoSection); err != nil {
+		return "", err
+	}
+
+	time.Sleep(5 * time.Second)
+
+	// 获取用户信息区域的HTML
+	infoHTML, err := b.GetHTML(`.pwB_uConside_a`)
+	if err != nil {
+		log.Printf("获取用户信息区域HTML失败: %v", err)
+		return "", err
+	}
+
+	// 使用goquery解析HTML
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(infoHTML))
+	if err != nil {
+		log.Printf("解析用户信息HTML失败: %v", err)
+		return "", err
+	}
+
+	// 创建一个结构保存用户信息
+	userInfo := make(map[string]string)
+
+	// 遍历表格行，提取需要的四个信息
+	doc.Find("table.pwB_uTable_a tr").Each(func(i int, s *goquery.Selection) {
+		key := strings.TrimSpace(s.Find("td").First().Text())
+		value := strings.TrimSpace(s.Find("th").First().Text())
+
+		// 只保存指定的四个信息
+		if key == "威望" || key == "金币" || key == "貢獻值" || key == "邀請幣" {
+			userInfo[key] = value
+		}
+	})
+
+	// 将收集到的信息格式化为文本
+	var sb strings.Builder
+	sb.WriteString("📊 用户积分信息 📊\n")
+
+	// 按特定顺序添加关键信息
+	keyInfo := []string{"威望", "金币", "貢獻值", "邀請幣"}
+
+	for _, key := range keyInfo {
+		if value, ok := userInfo[key]; ok {
+			sb.WriteString(fmt.Sprintf("📌 %s: %s\n", key, value))
+		}
+	}
+
+	// 如果没有找到任何信息
+	if len(userInfo) == 0 {
+		return "无法获取用户积分信息", nil
+	}
+
+	log.Printf("成功获取用户积分信息: %+v", userInfo)
+	return sb.String(), nil
 }
 
 // sendTelegramNotification 发送 Telegram 消息通知
@@ -494,74 +1068,123 @@ func SendTelegramNotification(message string) error {
 }
 
 func main() {
-	// 随机睡眠 0~120 秒
-	rand.Seed(time.Now().UnixNano())
-	delay := rand.Intn(WaitingTime)
-	log.Printf("等待 %d 秒后开始执行", delay)
-	time.Sleep(time.Duration(delay) * time.Second)
+	// // 随机睡眠 0~120 秒
+	// rand.Seed(time.Now().UnixNano())
+	// delay := rand.Intn(WaitingTime)
+	// log.Printf("等待 %d 秒后开始执行", delay)
+	// time.Sleep(time.Duration(delay) * time.Second)
 
-	// 创建浏览器实例
-	browser, err := NewBrowser()
-	if err != nil {
-		log.Fatalf("无法创建浏览器实例: %v", err)
-	}
-	defer browser.Close()
+	// // 创建浏览器实例
+	// browser, err := NewBrowser()
+	// if err != nil {
+	// 	log.Fatalf("无法创建浏览器实例: %v", err)
+	// }
+	// defer browser.Close()
 
-	// 访问论坛回帖页面
-	replyURL := BaseURL + ReplySection
-	if err = browser.NavigateTo(replyURL); err != nil {
-		log.Printf("导航回帖页失败: %v", err)
-		return
-	}
-	// 检查登陆状态
-	if err = browser.CheckLoginStatus(); err != nil {
-		log.Printf("检查登陆状态出错：%v", err)
-		return
+	// // 访问论坛回帖页面
+	// replyURL := BaseURL + ReplySection
+	// if err = browser.NavigateTo(replyURL); err != nil {
+	// 	log.Printf("导航回帖页失败: %v", err)
+	// 	return
+	// }
+	// // 检查登陆状态
+	// if err = browser.CheckLoginStatus(); err != nil {
+	// 	log.Printf("检查登陆状态出错：%v", err)
+	// 	return
+	// }
+
+	// // 访问论坛回帖页面并提取帖子数据
+	// if err = browser.NavigateTo(replyURL); err != nil {
+	// 	log.Printf("导航回帖页失败: %v", err)
+	// 	return
+	// }
+	// if err = browser.WaitForElement(ContentSelector); err != nil {
+	// 	log.Printf("等待元素失败: %v", err)
+	// 	return
+	// }
+	// htmlContent, err := browser.GetHTML("body")
+	// if err != nil {
+	// 	log.Printf("获取HTML失败: %v", err)
+	// 	return
+	// }
+	// title, href, err := GetFirstPost(htmlContent)
+	// if err != nil {
+	// 	log.Printf("提取数据失败: %v", err)
+	// 	return
+	// }
+	// log.Printf("找到帖子：%s, 链接：%s", title, href)
+	// fullURL := BaseURL + href
+	// if err = browser.NavigateTo(fullURL); err != nil {
+	// 	log.Printf("打开帖子失败: %v", err)
+	// 	return
+	// }
+
+	// // 回帖
+	// if err = browser.ReplyPost(); err != nil {
+	// 	log.Printf("回帖失败: %v", err)
+	// 	return
+	// }
+
+	// // 签到
+	// checkInResult, err := browser.CheckIn()
+	// if err != nil {
+	// 	log.Printf("签到失败: %v", err)
+	// 	return
+	// }
+
+	// // 打印今天的日期，以及签到成功的信息
+	// successMsg := fmt.Sprintf("%s 签到结果：%s", time.Now().Format("2006-01-02"), checkInResult)
+	// // 发送 Telegram 通知
+	// if err := SendTelegramNotification(successMsg); err != nil {
+	// 	log.Printf("发送 Telegram 通知失败: %v", err)
+	// }
+
+	log.Println("程序启动...")
+
+	// 初始化签到状态变量
+	todayCheckInSuccess = false
+	lastCheckInDate = time.Now().Format("2006-01-02")
+
+	// 启动Chrome进程监控
+	monitorStop := make(chan struct{})
+	go func() {
+		monitorChromeProcesses(monitorStop)
+	}()
+
+	// 启动调度器
+	startScheduler()
+
+	// 如果配置了立即执行任务，则立即执行一次
+	if RunOnStart {
+		go executeTask()
 	}
 
-	// 访问论坛回帖页面并提取帖子数据
-	if err = browser.NavigateTo(replyURL); err != nil {
-		log.Printf("导航回帖页失败: %v", err)
-		return
-	}
-	if err = browser.WaitForElement(ContentSelector); err != nil {
-		log.Printf("等待元素失败: %v", err)
-		return
-	}
-	htmlContent, err := browser.GetHTML("body")
-	if err != nil {
-		log.Printf("获取HTML失败: %v", err)
-		return
-	}
-	title, href, err := GetFirstPost(htmlContent)
-	if err != nil {
-		log.Printf("提取数据失败: %v", err)
-		return
-	}
-	log.Printf("找到帖子：%s, 链接：%s", title, href)
-	fullURL := BaseURL + href
-	if err = browser.NavigateTo(fullURL); err != nil {
-		log.Printf("打开帖子失败: %v", err)
-		return
+	// 设置信号处理
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	// 保持程序运行
+	log.Println("程序已启动，按Ctrl+C停止")
+
+	// 等待中断信号
+	<-c
+	log.Println("收到退出信号，正在清理资源...")
+
+	// 停止监控
+	close(monitorStop)
+
+	// 停止调度器
+	if scheduler != nil {
+		scheduler.Stop()
 	}
 
-	// 回帖
-	if err = browser.ReplyPost(); err != nil {
-		log.Printf("回帖失败: %v", err)
-		return
+	// 停止重试计时器
+	if retryTimer != nil {
+		retryTimer.Stop()
 	}
 
-	// 签到
-	checkInResult, err := browser.CheckIn()
-	if err != nil {
-		log.Printf("签到失败: %v", err)
-		return
-	}
+	// 清理Chrome进程
+	killPreviousChrome()
 
-	// 打印今天的日期，以及签到成功的信息
-	successMsg := fmt.Sprintf("%s 签到结果：%s", time.Now().Format("2006-01-02"), checkInResult)
-	// 发送 Telegram 通知
-	if err := SendTelegramNotification(successMsg); err != nil {
-		log.Printf("发送 Telegram 通知失败: %v", err)
-	}
+	log.Println("程序已安全退出")
 }

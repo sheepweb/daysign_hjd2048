@@ -1,0 +1,13 @@
+version: "3"
+
+services:
+  daysign:
+    image: daysign2048:latest
+    container_name: daysign2048
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+      - ./cookies:/app/cookies
+      - ./.env:/app/.env
+    environment:
+      - TZ=Asia/Shanghai
