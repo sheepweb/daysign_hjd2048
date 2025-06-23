@@ -781,8 +781,8 @@ func (b *Browser) CheckLoginStatus() error {
 		needLogin = true
 	}
 
-	// 检查 cookies 文件是否存在
-	fileInfo, err := os.Stat("./cookies")
+	// 检查 cookies 目录和文件是否存在
+	fileInfo, err := os.Stat("./cookies/data.json")
 	if err != nil {
 		// cookies 文件不存在
 		needLogin = true
@@ -797,7 +797,7 @@ func (b *Browser) CheckLoginStatus() error {
 
 	// 如果 cookies 过期，删除文件
 	if cookiesExpired {
-		err := os.Remove("./cookies")
+		err := os.Remove("./cookies/data.json")
 		if err != nil {
 			log.Printf("删除过期 cookies 文件失败: %v", err)
 		} else {
@@ -862,8 +862,14 @@ func (b *Browser) Login() error {
 
 // saveCookies 登陆后保存cookies到
 func (b *Browser) SaveCookies() string {
+	// 确保cookies目录存在
+	if err := os.MkdirAll("./cookies", 0755); err != nil {
+		log.Printf("创建cookies目录失败: %v", err)
+		return ""
+	}
+	
 	// 使用写入模式打开，并清空原文件内容
-	file, err := os.OpenFile("./cookies", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.ModePerm)
+	file, err := os.OpenFile("./cookies/data.json", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.ModePerm)
 	if err != nil {
 		log.Printf("打开cookies文件失败: %v", err)
 		return ""
@@ -901,7 +907,7 @@ func (b *Browser) SetCookies() error {
 	var text string
 	return b.Execute(
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			file, err := os.Open("./cookies")
+			file, err := os.Open("./cookies/data.json")
 			if err != nil {
 				return err
 			}
